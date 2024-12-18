@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math"
 	"os"
@@ -43,7 +44,7 @@ var performCalculationTool = &genai.Tool{
 
 // calc tool
 func performCalculation(valueOne string, valueTwo string, operator string) string {
-	log.Println("float: running performCalculation for " + valueOne + " " + operator + " " + valueTwo)
+	log.Println("running performCalculation for " + valueOne + " " + operator + " " + valueTwo)
 	one, _ := strconv.ParseFloat(valueOne, 64)
 	two, _ := strconv.ParseFloat(valueTwo, 64)
 	var result float64
@@ -59,55 +60,28 @@ func performCalculation(valueOne string, valueTwo string, operator string) strin
 	case "%":
 		result = math.Mod(one, two)
 	default:
-		log.Println("float: unsupported operator: " + operator)
+		log.Println("unsupported operator: " + operator)
 	}
 	return strconv.FormatFloat(result, 'f', -1, 64)
 }
 
-func main() {
-	// pull in the env vars and api key
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatalln("Error loading .env file")
-	}
-	apiKey, ok := os.LookupEnv("GEMINI_API_KEY")
-	if !ok {
-		log.Fatalln("Environment variable GEMINI_API_KEY not set")
-	}
-
-	// initialise the float agent
-	ctxFloat := context.Background()
+// agent initialization
+func initFloatAgent(ctx context.Context) (*genai.Client, *genai.GenerativeModel, error) {
 	system := `Your task is to perform high precision floating point calculations.
 Reply ONLY with the calculated result.`
 	var tools = []*genai.Tool{performCalculationTool}
-	clientFloat, modelFloat, err := InitAgent(ctxFloat, apiKey, &system, tools)
+	clientFloat, modelFloat, err := initAgent(ctx, &system, tools)
 	if err != nil {
-		log.Fatalln("Error initializing the Orchestrator")
+		log.Println("Error initializing the float agent")
+		return nil, nil, err
 	}
-	defer clientFloat.Close()
+	return clientFloat, modelFloat, err
+}
 
-	// start a new session
-	sessionFloat := modelFloat.StartChat()
+// tool call handler
+func callFloatTool(funcall genai.FunctionCall) (string, error) {
 
-	// make the request
-	resp, err := sessionFloat.SendMessage(ctxFloat, genai.Text("what is pi to 10 decimal places multiplied by 2.5"))
-	if err != nil {
-		log.Fatalf("Error sending message: %v", err)
-	}
-
-	// Check the response type for the first entry only for now
-	part := resp.Candidates[0].Content.Parts[0]
-	funcall, ok := part.(genai.FunctionCall)
-	if !ok {
-		// check for an ai reply
-		content, ok := part.(genai.Text)
-		if !ok {
-			log.Fatalf("Unexpected reply type, got %T", part)
-		}
-		// drop out with the reply
-		log.Println("Agent reply: " + content)
-	}
-
+	result := ""
 	// find the function to call
 	if funcall.Name == performCalculationTool.FunctionDeclarations[0].Name {
 		// check the params are populated
@@ -123,39 +97,68 @@ Reply ONLY with the calculated result.`
 		if !exists {
 			log.Fatalln("Missing value operator")
 		}
-		log.Println(valueOne.(string), valueTwo.(string), operator.(string))
 		// call the calc tool
-		result := performCalculation(valueOne.(string), valueTwo.(string), operator.(string))
+		result = performCalculation(valueOne.(string), valueTwo.(string), operator.(string))
 		log.Println("calculation result: " + result)
+	} else {
+		log.Println("unhandled function name: " + funcall.Name)
+		return "", errors.New("unhandled function name: " + funcall.Name)
+	}
+	return result, nil
+}
 
-		resp, err = sessionFloat.SendMessage(ctxFloat, genai.FunctionResponse{
-			Name: performCalculationTool.FunctionDeclarations[0].Name,
-			Response: map[string]any{
-				"answer": result,
-			},
-		})
-		if err != nil {
-			log.Fatal(err)
-		}
+// client tool for the floating point agent agent
+
+/////////////////////
+// general math agent
+
+// ///////////
+// main entry
+func main() {
+	// pull in the env vars
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatalln("error loading .env file")
 	}
 
-	for _, part := range resp.Candidates[0].Content.Parts {
-		log.Printf("Answer: %v\n", part)
+	// initialise the float agent
+	ctxFloat := context.Background()
+	clientFloat, modelFloat, err := initFloatAgent(ctxFloat)
+	if err != nil {
+		log.Fatalln("error initializing the Orchestrator")
 	}
+	defer clientFloat.Close()
+
+	// start a new session
+	sessionFloat := modelFloat.StartChat()
+
+	// run the agent
+	result, err := callAgent(ctxFloat, sessionFloat, "what is pi to 10 decimal places multiplied by 2.5", callFloatTool)
+	if err != nil {
+		log.Fatalln("error calling the agent")
+	}
+
+	log.Println("result: " + result)
 }
 
 /////////
 // Generic agent routines
 /////////
 
-func InitAgent(ctx context.Context, apiKey string, system *string, tools []*genai.Tool) (*genai.Client, *genai.GenerativeModel, error) {
+// initializer
+func initAgent(ctx context.Context, system *string, tools []*genai.Tool) (*genai.Client, *genai.GenerativeModel, error) {
+
+	// get the api key
+	apiKey, ok := os.LookupEnv("GEMINI_API_KEY")
+	if !ok {
+		return nil, nil, errors.New("environment variable GEMINI_API_KEY not set")
+	}
 
 	// create a new genai client
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		return nil, nil, err
 	}
-	//defer client.Close()
 
 	// select the model and configure to be a NL text agent
 	model := client.GenerativeModel("gemini-2.0-flash-exp")
@@ -172,4 +175,56 @@ func InitAgent(ctx context.Context, apiKey string, system *string, tools []*gena
 	model.ResponseMIMEType = "text/plain"
 
 	return client, model, nil
+}
+
+// call agent and run tools as required before returning the result
+// pre-determined graph flow of request, call tools as required, return final answer
+func callAgent(ctx context.Context, session *genai.ChatSession, message string, toolCall func(funcall genai.FunctionCall) (string, error)) (string, error) {
+
+	// make the initial request
+	resp, err := session.SendMessage(ctx, genai.Text(message))
+	if err != nil {
+		log.Println(err)
+		return "", err
+	}
+
+	// set max runs to 25
+	for idx := 0; idx < 25; idx++ {
+		// extract the first entry only for now
+		part := resp.Candidates[0].Content.Parts[0]
+
+		// check for a function call
+		funcall, ok := part.(genai.FunctionCall)
+		if ok {
+			// call the agent specific handler to get the response
+			result, err := toolCall(funcall)
+			if err != nil {
+				log.Println(err)
+				return "", err
+			}
+
+			// pass the result back to the session
+			resp, err = session.SendMessage(ctx, genai.FunctionResponse{
+				Name: funcall.Name,
+				Response: map[string]any{
+					"result": result,
+				},
+			})
+			if err != nil {
+				log.Println(err)
+				return "", err
+			}
+		}
+
+		// check for an text answer and end here
+		content, ok := part.(genai.Text)
+		if ok {
+			// drop out with the reply
+			log.Println("agent reply: " + content)
+			return string(content), nil
+		}
+	}
+
+	// if we are here we ran out of cycles
+	return "", errors.New("message cycles exceeded")
 }
