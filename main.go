@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"strconv"
 
@@ -66,16 +70,16 @@ func performCalculation(valueOne string, valueTwo string, operator string) strin
 }
 
 // agent initialization
-func initFloatAgent(ctx context.Context) (*genai.Client, *genai.GenerativeModel, error) {
+func initFloatAgent(ctx context.Context) (*agent, error) {
 	system := `Your task is to perform high precision floating point calculations.
 Reply ONLY with the calculated result.`
 	var tools = []*genai.Tool{performCalculationTool}
-	clientFloat, modelFloat, err := initAgent(ctx, &system, tools)
+	agentFloat, err := initAgent(ctx, &system, tools, callFloatTool)
 	if err != nil {
 		log.Println("Error initializing the float agent")
-		return nil, nil, err
+		return nil, err
 	}
-	return clientFloat, modelFloat, err
+	return agentFloat, err
 }
 
 // tool call handler
@@ -107,10 +111,64 @@ func callFloatTool(funcall genai.FunctionCall) (string, error) {
 	return result, nil
 }
 
-// client tool for the floating point agent agent
+// client tool for the floating point agent
+func floatAgentTool(message string) (string, error) {
+
+	// get the float agent endpoint
+	floatHostname, ok := os.LookupEnv("FLOAT_AGENT_HOSTNAME")
+	if !ok {
+		log.Fatalln("environment variable FLOAT_AGENT_HOSTNAME not set")
+	}
+	floatPort, ok := os.LookupEnv("FLOAT_AGENT_PORT")
+	if !ok {
+		log.Fatalln("environment variable FLOAT_AGENT_PORT not set")
+	}
+
+	// build the payload
+	request := request{
+		Input: message,
+	}
+	reqDat, err := json.Marshal(request)
+	if err != nil {
+		return "", err
+	}
+
+	// repare the request
+	req, err := http.NewRequest("POST", "http://"+floatHostname+":"+floatPort, bytes.NewBuffer(reqDat))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// send the post
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// extract and decode the reply
+	response := response{}
+	respDat, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	err = json.Unmarshal(respDat, &response)
+	if err != nil {
+		return "", err
+	}
+
+	return response.Content, nil
+}
 
 /////////////////////
 // general math agent
+
+//HERE
+
+// agent list
+var agentFloat *agent
 
 // ///////////
 // main entry
@@ -123,17 +181,28 @@ func main() {
 
 	// initialise the float agent
 	ctxFloat := context.Background()
-	clientFloat, modelFloat, err := initFloatAgent(ctxFloat)
+	agentFloat, err = initFloatAgent(ctxFloat)
 	if err != nil {
 		log.Fatalln("error initializing the Orchestrator")
 	}
-	defer clientFloat.Close()
+	defer agentFloat.client.Close()
 
+	// run the float agent as a service
+	floatHostname, ok := os.LookupEnv("FLOAT_AGENT_HOSTNAME")
+	if !ok {
+		log.Fatalln("environment variable FLOAT_AGENT_HOSTNAME not set")
+	}
+	floatPort, ok := os.LookupEnv("FLOAT_AGENT_PORT")
+	if !ok {
+		log.Fatalln("environment variable FLOAT_AGENT_PORT not set")
+	}
+	go agentFloat.runAgent(floatHostname, floatPort)
+
+	// This will be moved to general math agent
 	// start a new session
-	sessionFloat := modelFloat.StartChat()
-
+	agentFloat.newSession()
 	// run the agent
-	result, err := callAgent(ctxFloat, sessionFloat, "what is pi to 10 decimal places multiplied by 2.5", callFloatTool)
+	result, err := agentFloat.callAgent(agentFloat.session, "what is pi to 10 decimal places multiplied by 2.5")
 	if err != nil {
 		log.Fatalln("error calling the agent")
 	}
@@ -145,19 +214,29 @@ func main() {
 // Generic agent routines
 /////////
 
+type agent struct {
+	ctx      context.Context
+	client   *genai.Client
+	model    *genai.GenerativeModel
+	session  *genai.ChatSession
+	system   *string
+	tools    []*genai.Tool
+	toolCall func(funcall genai.FunctionCall) (string, error)
+}
+
 // initializer
-func initAgent(ctx context.Context, system *string, tools []*genai.Tool) (*genai.Client, *genai.GenerativeModel, error) {
+func initAgent(ctx context.Context, system *string, tools []*genai.Tool, toolCall func(funcall genai.FunctionCall) (string, error)) (*agent, error) {
 
 	// get the api key
 	apiKey, ok := os.LookupEnv("GEMINI_API_KEY")
 	if !ok {
-		return nil, nil, errors.New("environment variable GEMINI_API_KEY not set")
+		return nil, errors.New("environment variable GEMINI_API_KEY not set")
 	}
 
 	// create a new genai client
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// select the model and configure to be a NL text agent
@@ -174,15 +253,29 @@ func initAgent(ctx context.Context, system *string, tools []*genai.Tool) (*genai
 	}
 	model.ResponseMIMEType = "text/plain"
 
-	return client, model, nil
+	// populate the agent and return
+	agent := agent{
+		ctx:      ctx,
+		client:   client,
+		model:    model,
+		system:   system,
+		tools:    tools,
+		toolCall: toolCall,
+	}
+
+	return &agent, nil
+}
+
+func (agent *agent) newSession() {
+	agent.session = agentFloat.model.StartChat()
 }
 
 // call agent and run tools as required before returning the result
 // pre-determined graph flow of request, call tools as required, return final answer
-func callAgent(ctx context.Context, session *genai.ChatSession, message string, toolCall func(funcall genai.FunctionCall) (string, error)) (string, error) {
+func (agent *agent) callAgent(session *genai.ChatSession, message string) (string, error) {
 
 	// make the initial request
-	resp, err := session.SendMessage(ctx, genai.Text(message))
+	resp, err := session.SendMessage(agent.ctx, genai.Text(message))
 	if err != nil {
 		log.Println(err)
 		return "", err
@@ -197,14 +290,14 @@ func callAgent(ctx context.Context, session *genai.ChatSession, message string, 
 		funcall, ok := part.(genai.FunctionCall)
 		if ok {
 			// call the agent specific handler to get the response
-			result, err := toolCall(funcall)
+			result, err := agent.toolCall(funcall)
 			if err != nil {
 				log.Println(err)
 				return "", err
 			}
 
 			// pass the result back to the session
-			resp, err = session.SendMessage(ctx, genai.FunctionResponse{
+			resp, err = session.SendMessage(agent.ctx, genai.FunctionResponse{
 				Name: funcall.Name,
 				Response: map[string]any{
 					"result": result,
@@ -227,4 +320,55 @@ func callAgent(ctx context.Context, session *genai.ChatSession, message string, 
 
 	// if we are here we ran out of cycles
 	return "", errors.New("message cycles exceeded")
+}
+
+// base agent request / response
+type request struct {
+	Input string `json:"input"`
+}
+type response struct {
+	Content string `json:"content"`
+}
+
+// generalized agent request handler
+func (agent *agent) handleAgentRequest(res http.ResponseWriter, req *http.Request) {
+
+	// check for post
+	if req.Method != "POST" {
+		http.Error(res, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	// check for json mime type
+	contentType := req.Header.Get("Content-Type")
+	if contentType == "" || contentType != "application/json" {
+		http.Error(res, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	// decode the body
+	var reqBody request
+	err := json.NewDecoder(req.Body).Decode(&reqBody)
+	if err != nil {
+		http.Error(res, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	// call the agent
+	result, err := agent.callAgent(agent.session, reqBody.Input)
+	if err != nil {
+		http.Error(res, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	// send the result back
+	response := response{
+		Content: result,
+	}
+	res.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(res).Encode(response)
+}
+
+// generalized agent service at <hostname>:<port>/agent
+func (agent *agent) runAgent(hostname string, port string) {
+	http.HandleFunc("/agent", agent.handleAgentRequest)
+	http.ListenAndServe(hostname+":"+port, nil)
 }
