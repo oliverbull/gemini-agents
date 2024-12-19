@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/google/generative-ai-go/genai"
 	"github.com/joho/godotenv"
@@ -24,7 +25,7 @@ import (
 var performCalculationTool = &genai.Tool{
 	FunctionDeclarations: []*genai.FunctionDeclaration{{
 		Name:        "performCalculation",
-		Description: "Perform a flating point calculation for the supplied values and operator",
+		Description: "Perform a floating point calculation for the supplied values and operator",
 		Parameters: &genai.Schema{
 			Type: genai.TypeObject,
 			Properties: map[string]*genai.Schema{
@@ -111,8 +112,26 @@ func callFloatTool(funcall genai.FunctionCall) (string, error) {
 	return result, nil
 }
 
+// client tool for the floating point agent description
+var callFloatAgentTool = &genai.Tool{
+	FunctionDeclarations: []*genai.FunctionDeclaration{{
+		Name:        "callFloatAgent",
+		Description: "Make a request to the floating point agent. The agent will perform the calculation and return the result.",
+		Parameters: &genai.Schema{
+			Type: genai.TypeObject,
+			Properties: map[string]*genai.Schema{
+				"message": {
+					Type:        genai.TypeString,
+					Description: "The natural language request message for the floating point calculation agent",
+				},
+			},
+			Required: []string{"message"},
+		},
+	}},
+}
+
 // client tool for the floating point agent
-func floatAgentTool(message string) (string, error) {
+func callFloatAgent(message string) (string, error) {
 
 	// get the float agent endpoint
 	floatHostname, ok := os.LookupEnv("FLOAT_AGENT_HOSTNAME")
@@ -165,10 +184,50 @@ func floatAgentTool(message string) (string, error) {
 /////////////////////
 // general math agent
 
-//HERE
+// agent initialization
+func initMathAgent(ctx context.Context) (*agent, error) {
+	system := `Your task is to perform math calculations.
+Use agent tools to help with your results.
+Reply ONLY with the calculated result.`
+	var tools = []*genai.Tool{callFloatAgentTool}
+	agentMath, err := initAgent(ctx, &system, tools, callMathTool)
+	if err != nil {
+		log.Println("error initializing the math agent")
+		return nil, err
+	}
+	return agentMath, err
+}
+
+// tool call handler
+func callMathTool(funcall genai.FunctionCall) (string, error) {
+
+	result := ""
+	// find the function to call
+	if funcall.Name == callFloatAgentTool.FunctionDeclarations[0].Name {
+		// check the params are populated
+		message, exists := funcall.Args["message"]
+		if !exists {
+			log.Println("error missing message")
+			return "", errors.New("error missing message")
+		}
+		// call the float agent
+		var err error
+		result, err = callFloatAgent(message.(string))
+		if err != nil {
+			log.Println(err)
+			return "", err
+		}
+		log.Println("calculation result: " + result)
+	} else {
+		log.Println("unhandled function name: " + funcall.Name)
+		return "", errors.New("unhandled function name: " + funcall.Name)
+	}
+	return result, nil
+}
 
 // agent list
 var agentFloat *agent
+var agentMath *agent
 
 // ///////////
 // main entry
@@ -187,7 +246,7 @@ func main() {
 	}
 	defer agentFloat.client.Close()
 
-	// run the float agent as a service
+	// run the float agent as a service with a single session
 	floatHostname, ok := os.LookupEnv("FLOAT_AGENT_HOSTNAME")
 	if !ok {
 		log.Fatalln("environment variable FLOAT_AGENT_HOSTNAME not set")
@@ -196,13 +255,23 @@ func main() {
 	if !ok {
 		log.Fatalln("environment variable FLOAT_AGENT_PORT not set")
 	}
-	go agentFloat.runAgent(floatHostname, floatPort)
-
-	// This will be moved to general math agent
-	// start a new session
 	agentFloat.newSession()
-	// run the agent
-	result, err := agentFloat.callAgent(agentFloat.session, "what is pi to 10 decimal places multiplied by 2.5")
+	agentFloat.runAgent(floatHostname, floatPort)
+
+	time.Sleep(2000)
+
+	// initialize the math agent
+	ctxMath := context.Background()
+	agentMath, err = initMathAgent(ctxMath)
+	if err != nil {
+		log.Fatalln("error initializing the Orchestrator")
+	}
+	defer agentMath.client.Close()
+
+	// start a new math session
+	agentMath.newSession()
+	// run the math agent
+	result, err := agentMath.callAgent("what is pi to 10 decimal places multiplied by 2.5")
 	if err != nil {
 		log.Fatalln("error calling the agent")
 	}
@@ -272,10 +341,10 @@ func (agent *agent) newSession() {
 
 // call agent and run tools as required before returning the result
 // pre-determined graph flow of request, call tools as required, return final answer
-func (agent *agent) callAgent(session *genai.ChatSession, message string) (string, error) {
+func (agent *agent) callAgent(message string) (string, error) {
 
 	// make the initial request
-	resp, err := session.SendMessage(agent.ctx, genai.Text(message))
+	resp, err := agent.session.SendMessage(agent.ctx, genai.Text(message))
 	if err != nil {
 		log.Println(err)
 		return "", err
@@ -297,7 +366,7 @@ func (agent *agent) callAgent(session *genai.ChatSession, message string) (strin
 			}
 
 			// pass the result back to the session
-			resp, err = session.SendMessage(agent.ctx, genai.FunctionResponse{
+			resp, err = agent.session.SendMessage(agent.ctx, genai.FunctionResponse{
 				Name: funcall.Name,
 				Response: map[string]any{
 					"result": result,
@@ -353,7 +422,7 @@ func (agent *agent) handleAgentRequest(res http.ResponseWriter, req *http.Reques
 	}
 
 	// call the agent
-	result, err := agent.callAgent(agent.session, reqBody.Input)
+	result, err := agent.callAgent(reqBody.Input)
 	if err != nil {
 		http.Error(res, "Bad Request", http.StatusBadRequest)
 		return
@@ -370,5 +439,6 @@ func (agent *agent) handleAgentRequest(res http.ResponseWriter, req *http.Reques
 // generalized agent service at <hostname>:<port>/agent
 func (agent *agent) runAgent(hostname string, port string) {
 	http.HandleFunc("/agent", agent.handleAgentRequest)
-	http.ListenAndServe(hostname+":"+port, nil)
+	go http.ListenAndServe(hostname+":"+port, nil)
+	log.Println("agent running at: " + hostname + ":" + port)
 }
