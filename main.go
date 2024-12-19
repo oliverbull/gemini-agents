@@ -49,7 +49,7 @@ var performCalculationTool = &genai.Tool{
 
 // calc tool
 func performCalculation(valueOne string, valueTwo string, operator string) string {
-	log.Println("running performCalculation for " + valueOne + " " + operator + " " + valueTwo)
+	log.Println("running performCalculation tool for " + valueOne + " " + operator + " " + valueTwo)
 	one, _ := strconv.ParseFloat(valueOne, 64)
 	two, _ := strconv.ParseFloat(valueTwo, 64)
 	var result float64
@@ -132,6 +132,7 @@ var callFloatAgentTool = &genai.Tool{
 
 // client tool for the floating point agent
 func callFloatAgent(message string) (string, error) {
+	log.Println("running callFloatAgent tool for :" + message)
 
 	// get the float agent endpoint
 	floatHostname, ok := os.LookupEnv("FLOAT_AGENT_HOSTNAME")
@@ -153,7 +154,7 @@ func callFloatAgent(message string) (string, error) {
 	}
 
 	// repare the request
-	req, err := http.NewRequest("POST", "http://"+floatHostname+":"+floatPort, bytes.NewBuffer(reqDat))
+	req, err := http.NewRequest("POST", "http://"+floatHostname+":"+floatPort+"/agent", bytes.NewBuffer(reqDat))
 	if err != nil {
 		return "", err
 	}
@@ -217,7 +218,7 @@ func callMathTool(funcall genai.FunctionCall) (string, error) {
 			log.Println(err)
 			return "", err
 		}
-		log.Println("calculation result: " + result)
+		log.Println("float agent result: " + result)
 	} else {
 		log.Println("unhandled function name: " + funcall.Name)
 		return "", errors.New("unhandled function name: " + funcall.Name)
@@ -242,7 +243,7 @@ func main() {
 	ctxFloat := context.Background()
 	agentFloat, err = initFloatAgent(ctxFloat)
 	if err != nil {
-		log.Fatalln("error initializing the Orchestrator")
+		log.Fatalln("error initializing the Float Agent")
 	}
 	defer agentFloat.client.Close()
 
@@ -264,7 +265,7 @@ func main() {
 	ctxMath := context.Background()
 	agentMath, err = initMathAgent(ctxMath)
 	if err != nil {
-		log.Fatalln("error initializing the Orchestrator")
+		log.Fatalln("error initializing the Math Agent")
 	}
 	defer agentMath.client.Close()
 
@@ -336,7 +337,7 @@ func initAgent(ctx context.Context, system *string, tools []*genai.Tool, toolCal
 }
 
 func (agent *agent) newSession() {
-	agent.session = agentFloat.model.StartChat()
+	agent.session = agent.model.StartChat()
 }
 
 // call agent and run tools as required before returning the result
