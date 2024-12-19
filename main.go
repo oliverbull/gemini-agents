@@ -188,7 +188,7 @@ func callFloatAgent(message string) (string, error) {
 // agent initialization
 func initMathAgent(ctx context.Context) (*agent, error) {
 	system := `Your task is to perform math calculations.
-Use agent tools to help with your results.
+For floating point requests use agent tools to help with your results.
 Reply ONLY with the calculated result.`
 	var tools = []*genai.Tool{callFloatAgentTool}
 	agentMath, err := initAgent(ctx, &system, tools, callMathTool)
@@ -273,6 +273,7 @@ func main() {
 	agentMath.newSession()
 	// run the math agent
 	result, err := agentMath.callAgent("what is pi to 10 decimal places multiplied by 2.5")
+	//result, err := agentMath.callAgent("what is 1+1")
 	if err != nil {
 		log.Fatalln("error calling the agent")
 	}
