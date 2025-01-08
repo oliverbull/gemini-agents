@@ -9,13 +9,13 @@ The 'float agent' serves the request and passes the it to its LLM which in turn 
 
 The 'math agent' then passses the result back to the LLM for final result.
 
-The abstraction routines (see below) allows rapid development of agents with tools through an agent specific init function, session function, and either run agent (for a service) or call agent (for direct interaction).
+The abstraction package (see below) allows rapid development of agents with tools through an agent specific init function, session function, and either run agent (for a service) or call agent (for direct interaction).
 
 This is a very simple example, that can scale to many agents all interacting with each other.
 
-## Abstraction
+## Gemini-Agent-Assemble abstraction package
 
-The generic routines section display an example of how to abstract the specific SDK calls into agent specific methods and create a generalized pattern for agent creation.
+The Gemini-Agent-Assemble routines display an example of how to abstract the specific SDK calls into agent specific methods and create a generalized pattern for agent creation.
 
 **initAgent()** Creates the client, populates the model with fixed defaults, adds a system prompt if supplied, adds the tools if supplied, saves the agent 'class' parameters, and returns the agent instance
 
