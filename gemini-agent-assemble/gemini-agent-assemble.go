@@ -77,6 +77,13 @@ func (agent *Agent) NewSession() {
 // pre-determined graph flow of request, call tools as required, return final answer
 func (agent *Agent) CallAgent(message string) (string, error) {
 
+	// check we have a session
+	if agent.session == nil {
+		err := errors.New("CallAgent(): no session configued. run NewSession() first")
+		log.Println(err)
+		return "", err
+	}
+
 	// make the initial request
 	resp, err := agent.session.SendMessage(agent.ctx, genai.Text(message))
 	if err != nil {
@@ -86,38 +93,42 @@ func (agent *Agent) CallAgent(message string) (string, error) {
 
 	// set max runs to 25
 	for idx := 0; idx < 25; idx++ {
-		// extract the first entry only for now
-		part := resp.Candidates[0].Content.Parts[0]
-
-		// check for a function call
-		funcall, ok := part.(genai.FunctionCall)
-		if ok {
-			// call the agent specific handler to get the response
-			result, err := agent.toolCall(funcall)
-			if err != nil {
-				log.Println(err)
-				return "", err
+		// process each of the parts
+		var funcResults []genai.Part
+		for _, part := range resp.Candidates[0].Content.Parts {
+			// check for a function call
+			funcall, ok := part.(genai.FunctionCall)
+			if ok {
+				// call the agent specific handler to get the response
+				result, err := agent.toolCall(funcall)
+				if err != nil {
+					log.Println(err)
+					return "", err
+				}
+				// save the result in the result slice
+				funcResult := genai.FunctionResponse{
+					Name: funcall.Name,
+					Response: map[string]any{
+						"result": result,
+					},
+				}
+				funcResults = append(funcResults, funcResult) // implicit interface cast
 			}
 
-			// pass the result back to the session
-			resp, err = agent.session.SendMessage(agent.ctx, genai.FunctionResponse{
-				Name: funcall.Name,
-				Response: map[string]any{
-					"result": result,
-				},
-			})
-			if err != nil {
-				log.Println(err)
-				return "", err
+			// check for ONLY a text answer and end here (text can be in function list)
+			content, ok := part.(genai.Text)
+			if len(funcResults) == 0 && ok {
+				// drop out with the reply
+				log.Println("agent reply: " + content)
+				return string(content), nil
 			}
 		}
 
-		// check for an text answer and end here
-		content, ok := part.(genai.Text)
-		if ok {
-			// drop out with the reply
-			log.Println("agent reply: " + content)
-			return string(content), nil
+		// pass the result back to the session
+		resp, err = agent.session.SendMessage(agent.ctx, funcResults...)
+		if err != nil {
+			log.Println(err)
+			return "", err
 		}
 	}
 
@@ -172,7 +183,8 @@ func (agent *Agent) HandleAgentRequest(res http.ResponseWriter, req *http.Reques
 
 // generalized agent service at <hostname>:<port>/agent
 func (agent *Agent) RunAgent(hostname string, port string) {
-	http.HandleFunc("/agent", agent.HandleAgentRequest)
-	go http.ListenAndServe(hostname+":"+port, nil)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/agent", agent.HandleAgentRequest)
+	go http.ListenAndServe(hostname+":"+port, mux)
 	log.Println("agent running at: " + hostname + ":" + port)
 }
